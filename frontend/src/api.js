@@ -30,3 +30,11 @@ export function postConfirm(token, design, candidate = 0) {
     body: JSON.stringify({ token, candidate, ...design }),
   });
 }
+
+export function postDiagnose(design) {
+  return request("/api/diagnose", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(design),
+  });
+}

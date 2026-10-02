@@ -7,7 +7,7 @@ import uuid
 from flask import Flask, jsonify, request, send_from_directory
 
 from db import Database
-from solver import solve_repair_top
+from solver import diagnose_unlocks, solve_repair_top
 from validate import ValidationError, canonical, validate_design
 from weave import find_violations
 
@@ -16,6 +16,8 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 # 修补预览最多并列枚举的同样最优候选数
 MAX_CANDIDATES = 3
+# 无解诊断最多返回的互异最少解锁集合数
+MAX_UNLOCK_SETS = 3
 
 db = Database(DB_PATH)
 
@@ -137,6 +139,75 @@ def confirm():
         return jsonify({"error": message}), status
 
     return jsonify({"state": _design_payload(design)})
+
+
+@app.post("/api/diagnose")
+def diagnose():
+    """无可行修补草稿的只读自诊断（不落库、不发令牌、不改任何稿件）。
+
+    保持尺寸、格值、K、可选 onesRange 不变，求使修补变为可行所需解除的
+    锁定格「全局最少数量」，并按解锁坐标列表字典序返回前 3 个互异解锁
+    集合及各自一份可行修补示例（满足环向浮长与总数区间，未解锁锁定格
+    保持原值）。即使全部解锁仍无解时明确报告结构性无解，不给出解锁建议。
+    """
+    try:
+        rows, cols, grid, locks, k, ones_range = validate_design(
+            request.get_json(silent=True))
+    except ValidationError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    input_obj = canonical(rows, cols, grid, locks, k, ones_range)
+    violations = find_violations(grid, rows, cols, k)
+    ones_count = sum(v for row in grid for v in row)
+
+    # 先按当前锁定做常规求解：已可修补时无需解锁（minUnlockCount=0）
+    solved = solve_repair_top(rows, cols, k, grid, locks, ones_range, limit=1)
+    if solved is not None:
+        first = solved["candidates"][0]
+        return jsonify({
+            "solvable": True,
+            "structural": False,
+            # 诊断仅供查看：不发令牌、不落库
+            "minUnlockCount": 0,
+            "unlockSetCount": 1,
+            "solutions": [{
+                "unlocks": [],
+                "repaired": first["repaired"],
+                "changes": first["flips"],
+                "onesCount": first["onesCount"],
+            }],
+            "violations": violations,
+            "input": input_obj,
+            "onesCount": ones_count,
+            "onesRange": input_obj["onesRange"],
+        })
+
+    # 当前锁定下无可行修补：求最少解锁集合
+    diag = diagnose_unlocks(rows, cols, k, grid, locks, ones_range,
+                            limit=MAX_UNLOCK_SETS)
+    if diag is None:
+        # 即使解除全部锁定仍无解：结构性无解（如 1×1、单行/单列，
+        # 或 onesRange 在浮长规则下本身不可达），不给出误导性解锁建议
+        return jsonify({
+            "solvable": False,
+            "structural": True,
+            "violations": violations,
+            "input": input_obj,
+            "onesCount": ones_count,
+            "onesRange": input_obj["onesRange"],
+        })
+
+    return jsonify({
+        "solvable": False,
+        "structural": False,
+        "minUnlockCount": diag["unlock_count"],
+        "unlockSetCount": len(diag["solutions"]),
+        "solutions": diag["solutions"],
+        "violations": violations,
+        "input": input_obj,
+        "onesCount": ones_count,
+        "onesRange": input_obj["onesRange"],
+    })
 
 
 @app.get("/")

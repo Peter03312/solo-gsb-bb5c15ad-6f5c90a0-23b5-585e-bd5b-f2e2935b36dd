@@ -164,7 +164,20 @@ main {
 }
 .flip-list { color: #2f6b4f; }
 
-.preview.stale { opacity: 0.65; }
+.preview.stale, .diagnosis.stale { opacity: 0.72; }
+.diagnosis .candidate-bar button.active {
+  background: #b07908;
+  border-color: #b07908;
+  color: #fff;
+}
+.apply-unlocks {
+  margin-top: 0.55rem;
+  background: #fdf3df;
+  border-color: var(--accent);
+  color: #7a5310;
+}
+.structural-text { color: #a32b2b; }
+.diagnosis .meta + .candidate-bar { margin-top: 0.4rem; }
 .stale-tag {
   font-size: 0.8rem;
   color: #a32b2b;

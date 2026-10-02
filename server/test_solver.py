@@ -5,7 +5,7 @@ import random
 import sys
 import time
 
-from solver import solve_repair, solve_repair_top
+from solver import solve_repair, solve_repair_top, diagnose_unlocks
 from weave import find_violations
 
 
@@ -278,6 +278,115 @@ def main():
         check_case(rows, cols, k, grid, locks,
                    f"随机#{i} {rows}x{cols} K={k} 锁{len(locks)}")
 
+    print("== 无解诊断（最少解锁集合，暴力对照） ==")
+
+    def brute_diagnose(rows, cols, k, grid, locks, ones_range, limit=3):
+        """暴力：枚举全部网格，按「被改变的锁定格集合」归类，
+        取全局最少集合（按坐标列表字典序前 limit）及各自字典序最小网格。"""
+        lock_cells = sorted(set(map(tuple, locks)))
+        cells = [(r, c) for r in range(rows) for c in range(cols)]
+        best = {}
+        for bits in itertools.product((0, 1), repeat=len(cells)):
+            g = [row[:] for row in grid]
+            for (r, c), b in zip(cells, bits):
+                g[r][c] = b
+            if find_violations(g, rows, cols, k):
+                continue
+            n1 = sum(bits)
+            if ones_range is not None and not (ones_range[0] <= n1 <= ones_range[1]):
+                continue
+            u = tuple((r, c) for (r, c) in lock_cells
+                      if g[r][c] != grid[r][c])
+            if u not in best or bits < best[u]:
+                best[u] = bits
+        if not best:
+            return None
+        m = min(len(u) for u in best)
+        top = sorted(((u, best[u]) for u in best if len(u) == m),
+                     key=lambda x: x[0])[:limit]
+        return m, [(list(map(list, u)), seq) for u, seq in top]
+
+    def check_diag(rows, cols, k, grid, locks, ones_range, label):
+        expected = brute_diagnose(rows, cols, k, grid, locks, ones_range)
+        got = diagnose_unlocks(rows, cols, k, grid, locks, ones_range)
+        if expected is None:
+            assert got is None, f"{label}: 应结构性无解却给建议 {got}"
+            print(f"  [OK] {label}: 全解锁仍无解（结构性）")
+            return
+        m, top = expected
+        assert got is not None and got["unlock_count"] == m, (
+            f"{label}: 最少解锁 {None if got is None else got['unlock_count']} != {m}")
+        assert len(got["solutions"]) == len(top), (
+            f"{label}: 方案数 {len(got['solutions'])} != {len(top)}")
+        seen = set()
+        for sol, (eu, eseq) in zip(got["solutions"], top):
+            assert sol["unlocks"] == eu, f"{label}: 解锁集合字典序错误"
+            seq = tuple(v for row in sol["repaired"] for v in row)
+            assert seq == eseq, f"{label}: 示例非字典序最小"
+            assert len(sol["unlocks"]) == m
+            assert sol["onesCount"] == sum(seq)
+            assert not find_violations(sol["repaired"], rows, cols, k)
+            if ones_range is not None:
+                assert ones_range[0] <= sol["onesCount"] <= ones_range[1]
+            us = set(map(tuple, sol["unlocks"]))
+            for (r, c) in set(map(tuple, locks)):
+                if (r, c) not in us:
+                    assert sol["repaired"][r][c] == grid[r][c]
+            ch = [(r, c) for r in range(rows) for c in range(cols)
+                  if sol["repaired"][r][c] != grid[r][c]]
+            assert list(map(tuple, sol["changes"])) == ch
+            seen.add(tuple(map(tuple, eu)))
+        assert len(seen) == len(top), f"{label}: 解锁集合必须互异"
+        print(f"  [OK] {label}: 最少解 {m} 格，{len(top)} 个集合")
+
+    # 固定用例
+    check_diag(1, 1, 2, [[0]], [[0, 0]], None, "1x1 全锁 结构性")
+    check_diag(1, 3, 1, [[0, 1, 0]], [[0, 0], [0, 1], [0, 2]],
+               None, "1x3 全锁 结构性")
+    check_diag(2, 2, 2, [[0, 0], [0, 0]], [[0, 0], [1, 0]],
+               None, "2x2 首列锁两0 两集合")
+    check_diag(3, 3, 2, [[0] * 3 for _ in range(3)],
+               [[0, c] for c in range(3)], None, "3x3 首行全锁0")
+    check_diag(4, 4, 2, [[0] * 4 for _ in range(4)],
+               [[0, c] for c in range(4)], (8, 8), "4x4 首行锁 区间[8,8]")
+    check_diag(4, 4, 2, [[0] * 4 for _ in range(4)],
+               [[r, c] for r in range(4) for c in range(4)], (9, 9),
+               "4x4 全锁 区间[9,9] 结构性")
+    # 本可修补（m=0，唯一空集合，示例即字典序最小修补）
+    check_diag(2, 2, 2, [[0, 0], [0, 0]], [], None, "2x2 无锁 m=0")
+
+    drng = random.Random(5027)
+    diag_n = 0
+    for i in range(4000):
+        rows = drng.randint(1, 4)
+        cols = drng.randint(1, 4)
+        if rows * cols > 12:
+            continue
+        k = drng.randint(1, 3)
+        grid = [[drng.randint(0, 1) for _ in range(cols)] for _ in range(rows)]
+        locks = [[r, c] for r in range(rows) for c in range(cols)
+                 if drng.random() < 0.45]
+        orng = None
+        if drng.random() < 0.4:
+            lo = drng.randint(0, rows * cols)
+            orng = (lo, drng.randint(lo, rows * cols))
+        # 诊断函数对任意草稿都有定义；这里聚焦无修补草稿
+        if solve_repair_top(rows, cols, k, grid, locks, orng) is not None:
+            continue
+        diag_n += 1
+        check_diag(rows, cols, k, grid, locks, orng,
+                   f"诊断随机#{i} {rows}x{cols} K={k} 锁{len(locks)}")
+    print(f"  [OK] 诊断随机暴力对照 {diag_n} 份无修补草稿全部一致")
+
+    # 诊断不改变输入（无副作用）：连续两次结果完全一致
+    g = [[0] * 3 for _ in range(3)]
+    lk = [[0, c] for c in range(3)]
+    d1 = diagnose_unlocks(3, 3, 2, g, lk)
+    d2 = diagnose_unlocks(3, 3, 2, g, lk)
+    assert d1 == d2
+    assert g == [[0] * 3 for _ in range(3)] and lk == [[0, c] for c in range(3)]
+    print("  [OK] 诊断无副作用、结果确定性一致")
+
     print("== 大网格性能 ==")
     for k in (1, 2, 3, 5, 8, 16, 1000):
         rows, cols = 16, 8
@@ -336,6 +445,25 @@ def main():
         print(f"  [OK] 16x8 K={k}: {len(qgot['candidates'])} 候选, "
               f"各翻转 {qgot['flip_count']} 格, {dt:.2f}s")
         assert dt < 15, "前3候选枚举超时"
+
+    print("== 大网格性能（无解诊断） ==")
+    dgrid = [[0] * 8 for _ in range(16)]
+    dlocks = [[r, c] for r in range(16) for c in range(8)]
+    t0 = time.time()
+    dgot = diagnose_unlocks(16, 8, 2, dgrid, dlocks)
+    dt = time.time() - t0
+    assert dgot is not None and 1 <= len(dgot["solutions"]) <= 3
+    for sol in dgot["solutions"]:
+        assert len(sol["unlocks"]) == dgot["unlock_count"]
+        assert not find_violations(sol["repaired"], 16, 8, 2)
+    print(f"  [OK] 16x8 全锁 K=2 诊断: 最少解 {dgot['unlock_count']} 格, "
+          f"{len(dgot['solutions'])} 集合, {dt:.2f}s")
+    assert dt < 15, "全锁诊断超时"
+    # 结构性（1 行）应快速判定
+    t0 = time.time()
+    assert diagnose_unlocks(1, 8, 2, [[0] * 8],
+                            [[0, c] for c in range(8)]) is None
+    print(f"  [OK] 1x8 结构性诊断, {time.time() - t0:.2f}s")
 
     print("\n全部通过")
     return 0
