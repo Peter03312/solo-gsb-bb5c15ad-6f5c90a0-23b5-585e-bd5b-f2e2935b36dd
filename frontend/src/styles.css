@@ -90,6 +90,8 @@ button:hover:not(:disabled) { filter: brightness(0.96); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 button.primary { background: var(--weft); border-color: var(--weft); color: #fff; }
 button.confirm { background: var(--ok); border-color: var(--ok); color: #fff; }
+button.diagnose { background: #8a5a16; border-color: #8a5a16; color: #fff; }
+button.apply-unlock { background: #1f6b8f; border-color: #1f6b8f; color: #fff; }
 
 .dirty-flag { font-size: 0.85rem; color: #8a90a3; }
 .dirty-flag.yes { color: #b07908; }
@@ -141,6 +143,11 @@ main {
 .cell.locked { box-shadow: inset 0 0 0 2px #e0a93e; }
 .cell.violation { outline: 3px solid var(--danger); outline-offset: -1px; }
 .cell.flipped { outline: 3px solid var(--ok); outline-offset: -1px; }
+.cell.unlocked {
+  box-shadow: inset 0 0 0 2px #e0a93e;
+  outline: 3px dashed #1f8fb0;
+  outline-offset: -1px;
+}
 
 .badge {
   position: absolute;
@@ -217,6 +224,13 @@ footer {
 .legend-cell.v0 { background: var(--warp); color: #8a7b4f; }
 .legend-cell.v1 { background: var(--weft); color: #eef1ff; }
 .legend-cell.locked { box-shadow: inset 0 0 0 2px #e0a93e; background: #fff; }
+.legend-cell.unlocked {
+  box-shadow: inset 0 0 0 2px #e0a93e;
+  outline: 2px dashed #1f8fb0;
+  outline-offset: -1px;
+  background: #fff;
+  font-size: 0.65rem;
+}
 .legend-cell.violation { outline: 2px solid var(--danger); background: #fff; color: #999; }
 .legend-cell.flipped { outline: 2px solid var(--ok); background: #fff; color: var(--ok); }
 

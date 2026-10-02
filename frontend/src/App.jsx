@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchState, postConfirm, postPreview } from "./api";
+import { fetchState, postConfirm, postDiagnose, postPreview } from "./api";
 import { findViolations, violationCellSet } from "./weave";
 import "./styles.css";
 
@@ -224,6 +224,9 @@ export default function App() {
   const [preview, setPreview] = useState(null);
   // 当前查看/选中的候选方案序号（0 = 字典序最小，也是默认确认方案）
   const [candidateIndex, setCandidateIndex] = useState(0);
+  // 无解诊断结果（只读建议，不产生令牌）与当前查看的解锁集合序号
+  const [diagnosis, setDiagnosis] = useState(null);
+  const [optionIndex, setOptionIndex] = useState(0);
   const [message, setMessage] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -274,6 +277,20 @@ export default function App() {
   const previewLockSet = useMemo(
     () => (preview ? lockSetOf(preview.input.locks) : new Set()),
     [preview],
+  );
+
+  // 诊断只读：草稿自诊断后若已变化，旧建议不得沿用（须重新诊断）
+  const diagnosisStale = Boolean(
+    diagnosis && draft && !sameDesign(draft, diagnosis.input));
+  const diagOptions = useMemo(() => {
+    if (!diagnosis || diagnosis.structurallyUnsolvable) return [];
+    return Array.isArray(diagnosis.options) ? diagnosis.options : [];
+  }, [diagnosis]);
+  const diagSafeIndex = Math.min(optionIndex, diagOptions.length - 1);
+  const selectedOption = diagOptions[diagSafeIndex] ?? null;
+  const diagUnlockSet = useMemo(
+    () => new Set((selectedOption?.unlocks ?? []).map(([r, c]) => `${r},${c}`)),
+    [selectedOption],
   );
 
   function handleCellClick(r, c) {
@@ -355,6 +372,63 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function handleDiagnose() {
+    const err = validateDraft(draft);
+    if (err) {
+      setMessage({ type: "error", text: err });
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await postDiagnose(draft);
+      setDiagnosis(result);
+      setOptionIndex(0);
+      if (result.structurallyUnsolvable) {
+        setMessage({
+          type: "info",
+          text: "诊断：结构性无解——即使解除全部锁定格，在当前尺寸、格值、K"
+            + (result.onesRange
+              ? ` 与格值1总数区间 [${result.onesRange[0]}, ${result.onesRange[1]}]`
+              : "")
+            + " 下仍不存在达标稿件，请调整尺寸、格值、K 或区间，解锁无济于事。",
+        });
+      } else if (result.unlockCount === 0) {
+        setMessage({
+          type: "success",
+          text: "诊断：当前草稿无需解除任何锁定格即存在可行修补，请直接预览。",
+        });
+      } else {
+        setMessage({
+          type: "info",
+          text: `诊断：无解由锁定格阻碍，至少需解除 ${result.unlockCount} 个锁定格；`
+            + `已按坐标序列出前 ${result.options.length} 个互异解锁集合，每个附一份可行修补示例。`,
+        });
+      }
+    } catch (e) {
+      setDiagnosis(null);
+      setOptionIndex(0);
+      setMessage({ type: "error", text: e.message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** 应用选中的解锁集合到当前草稿：仅从 locks 移除这些格，不动尺寸/格值/K/区间。
+   * 应用后草稿与诊断输入不再一致，旧建议立即视为失效，需重新诊断或预览。 */
+  function handleApplyUnlocks() {
+    if (!selectedOption || diagnosisStale) return;
+    const unlock = new Set(selectedOption.unlocks.map(([r, c]) => `${r},${c}`));
+    setDraft((d) => ({
+      ...d,
+      locks: sortLocks(d.locks.filter(([r, c]) => !unlock.has(`${r},${c}`))),
+    }));
+    setMessage({
+      type: "info",
+      text: `已把方案 ${diagSafeIndex + 1} 的 ${selectedOption.unlocks.length} 个锁定格`
+        + "从当前草稿解除（尺寸、格值、K 与区间均未改动）；诊断基于的草稿已变化，请重新预览或重新诊断。",
+    });
   }
 
   async function handleConfirm() {
@@ -472,6 +546,15 @@ export default function App() {
         <div className="actions">
           <button type="button" className="primary" disabled={busy} onClick={handlePreview}>
             预览修补
+          </button>
+          <button
+            type="button"
+            className="diagnose"
+            disabled={busy || rangeOutOfBounds}
+            onClick={handleDiagnose}
+            title="预览显示无可行修补时使用：区分锁定阻碍与结构性无解，并给出最少解锁建议"
+          >
+            无解诊断
           </button>
           <button type="button" className="confirm" disabled={!canConfirm} onClick={handleConfirm}>
             {preview?.solvable && candidates.length > 1
@@ -609,6 +692,107 @@ export default function App() {
               )}
             </section>
           )}
+
+          {diagnosis && (
+            <section className={`panel diagnosis ${diagnosisStale ? "stale" : ""}`}>
+              <h2>
+                无解诊断 {diagnosisStale && <span className="stale-tag">建议已失效</span>}
+              </h2>
+              {diagnosisStale && (
+                <p className="warn-text">
+                  诊断后草稿（尺寸、交织格、锁定格、K 或格值1总数区间）已变化，
+                  旧的解锁建议不得沿用，请重新诊断。
+                </p>
+              )}
+              {diagnosis.structurallyUnsolvable ? (
+                <p className="warn-text">
+                  结构性无解：即使解除全部锁定格，在当前尺寸、格值、K
+                  {diagnosis.onesRange
+                    ? ` 与格值1总数区间 [${diagnosis.onesRange[0]}, ${diagnosis.onesRange[1]}]`
+                    : ""}
+                  的共同约束下仍不存在达标稿件。请调整尺寸、格值、K 或区间，
+                  解除锁定无济于事。
+                </p>
+              ) : diagnosis.unlockCount === 0 ? (
+                <p className="ok-text">
+                  当前草稿无需解除任何锁定格即存在可行修补，请直接“预览修补”。
+                </p>
+              ) : (
+                <>
+                  <p className="warn-text">
+                    无解由锁定格阻碍：保持尺寸、格值、K
+                    {diagnosis.onesRange
+                      ? ` 与区间 [${diagnosis.onesRange[0]}, ${diagnosis.onesRange[1]}]`
+                      : ""}
+                    不变，全局最少需解除 <strong>{diagnosis.unlockCount}</strong> 个锁定格。
+                    以下为按坐标列表字典序排列的前 {diagOptions.length} 个互异解锁集合，
+                    各附一份满足环向浮长与总数区间的可行修补示例；示例中未解锁的锁定格均未改变。
+                  </p>
+                  {diagOptions.length > 1 && (
+                    <div className="candidate-bar" role="group" aria-label="解锁集合方案">
+                      {diagOptions.map((opt, i) => (
+                        <button
+                          key={i}
+                          type="button"
+                          className={i === diagSafeIndex ? "active" : ""}
+                          aria-pressed={i === diagSafeIndex}
+                          onClick={() => setOptionIndex(i)}
+                        >
+                          方案 {i + 1}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {selectedOption && (
+                    <>
+                      <p className="meta">
+                        方案 {diagSafeIndex + 1}/{diagOptions.length} ·
+                        解除 {selectedOption.unlocks.length} 格：
+                        {selectedOption.unlocks
+                          .map(([r, c]) => `(${r + 1},${c + 1})`)
+                          .join("、")}
+                      </p>
+                      <WeaveGrid
+                        grid={selectedOption.example.repaired}
+                        lockSet={lockSetOf(diagnosis.input.locks)}
+                        markOf={(r, c, key) => {
+                          if (diagUnlockSet.has(key)) return "unlocked";
+                          return selectedOption.example.flips
+                            .some(([fr, fc]) => fr === r && fc === c)
+                            ? "flipped" : "";
+                        }}
+                      />
+                      <p className="meta count-line">
+                        示例格值1总数：<strong>{selectedOption.example.onesCount}</strong>
+                        {diagnosis.onesRange
+                          ? <> · 要求区间 <strong>[{diagnosis.onesRange[0]}, {diagnosis.onesRange[1]}]</strong>
+                              {selectedOption.example.onesCount >= diagnosis.onesRange[0]
+                                && selectedOption.example.onesCount <= diagnosis.onesRange[1]
+                                ? " ✓ 达标" : " ✗ 未达标"}
+                            </>
+                          : " · 未设置区间"}
+                        {" "}· 示例翻转 {selectedOption.example.flips.length} 格
+                      </p>
+                      <p className="meta">
+                        橙框=原本锁定的格（蓝绿描边的为本方案建议解除者）；
+                        绿框 ↺=示例中的翻转位置。应用后仅修改当前草稿的锁定，不改变格值。
+                      </p>
+                      <div className="actions">
+                        <button
+                          type="button"
+                          className="apply-unlock"
+                          disabled={diagnosisStale}
+                          onClick={handleApplyUnlocks}
+                        >
+                          应用方案 {diagSafeIndex + 1} 到当前草稿
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+            </section>
+          )}
         </aside>
       </main>
 
@@ -616,6 +800,7 @@ export default function App() {
         <span className="legend-cell v0">0</span> 经线在上
         <span className="legend-cell v1">1</span> 纬线在上
         <span className="legend-cell locked">🔒</span> 锁定格（修补时不可翻转）
+        <span className="legend-cell unlocked">🔓</span> 诊断建议解除的锁定格
         <span className="legend-cell violation">0</span> 超限段
         <span className="legend-cell flipped">↺</span> 翻转位置
       </footer>

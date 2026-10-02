@@ -7,7 +7,7 @@ import uuid
 from flask import Flask, jsonify, request, send_from_directory
 
 from db import Database
-from solver import solve_repair_top
+from solver import diagnose_unlocks, solve_repair_top
 from validate import ValidationError, canonical, validate_design
 from weave import find_violations
 
@@ -90,6 +90,45 @@ def preview():
         # 按行展开格值字典序升序；确认时用 candidate 序号选择
         "candidateCount": len(candidates),
         **result,
+    })
+
+
+@app.post("/api/diagnose")
+def diagnose():
+    # 只读诊断：不落库、不发放令牌、不改变原稿/草稿/版本；
+    # 入参与 /api/preview 完全一致（尺寸、格值、锁定、K、可选 onesRange）。
+    try:
+        rows, cols, grid, locks, k, ones_range = validate_design(
+            request.get_json(silent=True))
+    except ValidationError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    input_obj = canonical(rows, cols, grid, locks, k, ones_range)
+    violations = find_violations(grid, rows, cols, k)
+    ones_count = sum(v for row in grid for v in row)
+    diagnosis = diagnose_unlocks(rows, cols, k, grid, locks, ones_range,
+                                 limit=MAX_CANDIDATES)
+
+    base = {
+        "violations": violations,
+        "input": input_obj,
+        "onesCount": ones_count,
+        "onesRange": input_obj["onesRange"],
+    }
+    if diagnosis["structural"]:
+        # 全部锁定格解除仍无解：结构性无解，明确报告且不给误导性解锁建议
+        return jsonify({
+            **base,
+            "structurallyUnsolvable": True,
+            "message": "即使解除全部锁定格，在当前尺寸、格值、K"
+                       "与格值1总数区间下仍不存在达标稿件，属于结构性无解；"
+                       "请调整尺寸、格值、K 或格值1总数区间，而非解除锁定。",
+        })
+    return jsonify({
+        **base,
+        "structurallyUnsolvable": False,
+        "unlockCount": diagnosis["unlock_count"],
+        "options": diagnosis["options"],
     })
 
 

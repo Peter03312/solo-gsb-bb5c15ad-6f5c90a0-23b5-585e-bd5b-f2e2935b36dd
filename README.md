@@ -44,6 +44,45 @@
 - 网页收到 409 后会清除旧预览、重新拉取原稿、保留当前未提交草稿，
   并提示重新预览后再确认。
 
+## 无可行修补的解锁诊断（本轮，只读）
+
+设计师遇到**无可行修补**的预览时，需要区分两种情况：是锁定格阻碍，
+还是即使把全部锁定格解除仍无可行稿（结构性无解）。新增的只读诊断
+`POST /api/diagnose` 入参与 `/api/preview` 完全一致（尺寸、格值、锁定、K、
+可选 `onesRange`），并遵循以下约定：
+
+- **只读**：诊断只返回建议，**不修改草稿、原稿、版本，不写库、不发确认令牌**；
+  原有可解预览、候选顺序与确认契约完全不变（诊断结果不可用于确认）。
+- **结构性无解**：若保持尺寸、格值、K 与 `onesRange` 不变、**即使解除全部
+  锁定格仍不存在达标稿件**，响应明确返回 `structurallyUnsolvable: true` 与
+  中文说明，且**不返回任何解锁建议**（无 `options`/`unlockCount`），
+  提示调整尺寸、格值、K 或总数区间，避免误导。
+- **锁定阻碍**：否则求解“使修补可行所需解除的锁定格数量”的**全局最小值**
+  （MaxSAT：软约束为尽量不解除锁定），并返回按**坐标列表字典序**排列的
+  **前 3 个互异解锁集合**（不足 3 个按实际数量）。坐标列表的比较为短字典序：
+  先比列表长度（解锁数相同），再逐项按行展开坐标 `[r,c]` 比较。
+- 每个集合附**一份可行修补示例**：该示例是在“只解除此集合、其余锁定格
+  仍锁定”的约束下全局翻转数最少（并列再按行展开格值字典序最小）的修补，
+  因此满足环向浮长 K 与 `onesRange`，且**未解锁的锁定格在示例中绝不改变**。
+- 草稿本身可解时调用诊断：返回 `unlockCount: 0`、唯一空集合 `unlocks: []`
+  与一份最优修补示例（等同预览首候选），属正常结果而非异常。
+- 网页可在诊断面板逐个查看前 3 个集合与示例，并把**选中的解锁集合应用到
+  当前草稿**（仅从 `locks` 移除这些格，尺寸、格值、K、区间均不变）；
+  **草稿自诊断后若已变化，应用按钮与旧建议一并失效**（面板标“建议已失效”），
+  须重新诊断后再应用，防止沿用过期建议。
+- 非法尺寸/格值/K/区间与预览一样返回 400。
+
+### 诊断响应字段约定
+
+- `structurallyUnsolvable`：`true` 表示全部解锁仍无解（结构性），此时
+  只有 `message` 提示而无 `options`、`unlockCount`。
+- 非结构性时：`unlockCount`（全局最少解锁数）、
+  `options: [{unlocks: [[r,c],…], example: {repaired, flips, onesCount}}, …]`
+  （1~3 项，集合互异、按坐标列表字典序）；
+  同时回显 `input`（规范化输入）、`violations`（原稿超限段）、
+  `onesCount`、`onesRange`，但**没有 `token`**。
+
+
 ## 冲突处理（预览令牌与版本）
 
 - `POST /api/preview`：服务端读取当前原稿版本 `v`，把规范化后的草稿输入
@@ -143,6 +182,44 @@ curl -s -X POST http://localhost:8000/api/confirm \
 # {"error":"预览令牌不存在或已被确认，请重新预览"}
 ```
 
+### 无解诊断调用示例（只读，不发令牌）
+
+```bash
+# 5. 无可行修补时诊断：区分“锁定阻碍”与“结构性无解”
+# 5a. 2x2 全0、K=1，锁定第 0 行两格 -> 锁定阻碍，最少解除 1 格，给前 3 个集合
+curl -s -X POST http://localhost:8000/api/diagnose \
+  -H 'Content-Type: application/json' \
+  -d '{"rows":2,"cols":2,"grid":[[0,0],[0,0]],"locks":[[0,0],[0,1]],"k":1}'
+# {"structurallyUnsolvable":false,"unlockCount":1,
+#  "options":[
+#    {"unlocks":[[0,0]],
+#     "example":{"repaired":[[1,0],[0,1]],"flips":[[0,0],[1,1]],"onesCount":2}},
+#    {"unlocks":[[0,1]],
+#     "example":{"repaired":[[0,1],[1,0]],"flips":[[0,1],[1,0]],"onesCount":2}}],
+#  "onesRange":null,"onesCount":0, ...}   （无 token 字段）
+
+# 5b. 1x1：行/列恒全同，即使无锁也无解 -> 结构性无解，不给解锁建议
+curl -s -X POST http://localhost:8000/api/diagnose \
+  -H 'Content-Type: application/json' \
+  -d '{"rows":1,"cols":1,"grid":[[0]],"locks":[],"k":2}'
+# {"structurallyUnsolvable":true,
+#  "message":"即使解除全部锁定格……属于结构性无解；请调整尺寸、格值、K 或……",
+#  ...}   （无 options / unlockCount / token）
+
+# 5c. 格值1总数区间结构性不可达（3x3 K=2 合法网格最多 6 个 1）
+curl -s -X POST http://localhost:8000/api/diagnose \
+  -H 'Content-Type: application/json' \
+  -d '{"rows":3,"cols":3,"grid":[[0,0,0],[0,0,0],[0,0,0]],
+       "locks":[[0,0],[0,1],[0,2],[1,0],[1,1],[1,2],[2,0],[2,1],[2,2]],
+       "k":2,"onesRange":[7,9]}'
+# {"structurallyUnsolvable":true,"onesRange":[7,9], ...}
+
+# 5d. 诊断只读取自草稿；网页应用某个 unlocks 后用 /api/preview 重新预览即可解
+```
+
+> 诊断不产生令牌，也没有任何确认副作用；对可解草稿调用会返回
+> `unlockCount:0`、空解锁集合与一份最优修补示例。
+
 ## 一键启动（Docker Compose）
 
 ```bash
@@ -228,13 +305,30 @@ python test_confirm_race.py
 合法候选叠加草稿改动仍 409、同一令牌携带不同候选并发仅一次生效、
 旧版预览（无 `candidates`）只能确认首个方案。
 
+```bash
+cd server
+python test_diagnose.py
+python test_diagnose_api.py
+```
+
+无解诊断测试内容（求解器层，含 80 组随机暴力对照）：锁定阻碍时全局最少
+解锁数与前 3 个互异集合的坐标列表字典序、每份示例为“仅解除该集合”约束下
+全局翻转最少且字典序最小、示例满足环向浮长与 `onesRange`、未解锁锁定格
+不改变；全部解锁仍无解（1×1、1×3、区间结构性不可达等）明确返回结构性无解
+且不给建议；可解草稿返回解锁 0 与空集合；16×8 高锁定比例与结构性用例性能。
+接口层另测：诊断 200 结构、非法输入 400、响应无 `token`、不写 `preview` 表、
+原稿与版本不变、诊断后不能凭任何令牌确认、回显 `input/violations/onesCount/
+onesRange`、应用每个解锁集合后 `/api/preview` 即可解且首候选与诊断示例一致、
+原有预览/确认契约与版本递增保持不变。
+
 ## API 简介
 
 | 方法 | 路径           | 说明                                                         |
 | ---- | -------------- | ------------------------------------------------------------ |
 | GET  | `/api/state`   | 返回当前原稿（尺寸、格值、锁定格、K、**格值1总数区间**、版本号、**格值1总数 `onesCount`**）及其超限段 |
 | POST | `/api/preview` | 提交草稿（可选 `onesRange:[下限,上限]`），返回超限段与至多 3 个同样最优修补候选（双方格值1总数、区间、翻转位置、令牌）；非法输入 400，无解（含区间不可达）时 `solvable=false` 且无令牌 |
-| POST | `/api/confirm` | 携带预览令牌、当前草稿（含一致的 `onesRange`）与可选 `candidate` 序号；原子校验令牌未消费、草稿与预览输入一致（含区间）、原稿版本未变、候选存在，成功才覆盖原稿与区间（版本 +1）并消费令牌；候选越界/伪造返回 400，重复/过期/草稿或区间不匹配返回 409 且原稿不变 |
+| POST | `/api/diagnose` | **只读**无解诊断：入参与 preview 相同。锁定阻碍时返回全局最少解锁数 `unlockCount` 与按坐标列表字典序的前 3 个互异 `options`（各含 `unlocks` 与一份满足浮长/区间、不改动未解锁格的可行修补 `example`），无 `token`、不写库、不改原稿与版本；全部解锁仍无解时 `structurallyUnsolvable=true` 且不给解锁建议；非法输入 400 |
+| POST | `/api/confirm` | 携带预览令牌、当前草稿（含一致的 `onesRange`）与可选 `candidate` 序号；原子校验令牌未消费、草稿与预览输入一致（含区间）、原稿版本未变、候选存在，成功才覆盖原稿与区间（版本 +1）并消费令牌；候选越界/伪造返回 400，重复/过期/草稿或区间不匹配返回 409 且原稿不变（诊断不发令牌，此接口不接受诊断结果） |
 
 ### 候选比选字段约定（`candidates` / `candidate`）
 
@@ -270,17 +364,19 @@ python test_confirm_race.py
 ├── Dockerfile              # 多阶段：前端构建 + 后端运行
 ├── docker-compose.yml      # 一键启动
 ├── server/                 # Python 后端
-│   ├── app.py              # Flask 路由（state / preview / confirm）
-│   ├── solver.py           # SAT/MaxSAT 最优修补求解
+│   ├── app.py              # Flask 路由（state / preview / diagnose / confirm）
+│   ├── solver.py           # SAT/MaxSAT 最优修补求解 + 最少解锁诊断
 │   ├── weave.py            # 环向超限段检测
 │   ├── validate.py         # 尺寸/格值/锁定/K 校验
 │   ├── db.py               # SQLite 持久化与初始化（预览版本绑定 + 原子确认事务）
 │   ├── test_solver.py      # 求解器测试（含暴力对照）
+│   ├── test_diagnose.py    # 最少解锁诊断求解器测试（含暴力对照）
+│   ├── test_diagnose_api.py# 诊断接口端到端测试（只读、字段、闭环）
 │   ├── test_confirm_race.py # 确认竞争端到端测试（含并发、冲突拒绝）
 │   └── requirements.txt
 └── frontend/               # React 前端（Vite）
     └── src/
-        ├── App.jsx         # 编辑器、预览、确认交互
+        ├── App.jsx         # 编辑器、预览、无解诊断（含应用解锁集合）、确认交互
         ├── weave.js        # 前端实时超限段检测
         └── api.js
 ```

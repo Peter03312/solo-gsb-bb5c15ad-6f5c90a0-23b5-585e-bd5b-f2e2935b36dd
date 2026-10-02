@@ -23,6 +23,14 @@ export function postPreview(design) {
   });
 }
 
+export function postDiagnose(design) {
+  return request("/api/diagnose", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(design),
+  });
+}
+
 export function postConfirm(token, design, candidate = 0) {
   return request("/api/confirm", {
     method: "POST",

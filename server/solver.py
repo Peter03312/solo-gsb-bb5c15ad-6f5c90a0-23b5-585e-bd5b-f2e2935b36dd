@@ -252,6 +252,145 @@ def solve_repair_top(rows, cols, k, grid, locks, ones_range=None, limit=3):
     return {"flip_count": best, "candidates": candidates}
 
 
+def _enumerate_unlock_sets(clauses, unlock_vars, best, limit, next_free):
+    """在同一增量 SAT 实例上按坐标列表字典序枚举至多 limit 个解锁集合。
+
+    对每个锁定格（unlock_vars 按行展开序排列）依次决定是否解除锁定：
+    先尝试纳入（正文字），再尝试保留锁定（负文字），因此叶子出现的顺序
+    恰为集合的短字典序（先按列表长度，再逐项按行展开坐标比较）。
+    用 |集合| <= best 与 |集合| >= best 剪枝（best 为全局最少解锁数）。
+    与 _enumerate_lex 同理，以完整前缀上的确认求解为准。
+    next_free 为 clauses 已用辅助变量之后的第一个空闲变量号。
+    """
+    results = []
+    # |已选| <= best：best >= n 时恒成立，无需编码
+    clauses = [cl[:] for cl in clauses]
+    clauses, free = _at_most(clauses, unlock_vars, best, next_free)
+    # |已选| >= best：best == 0 时恒成立
+    if best > 0:
+        enc = CardEnc.atleast(lits=unlock_vars, bound=best, top_id=free - 1,
+                              encoding=EncType.totalizer)
+        clauses.extend(enc.clauses)
+
+    with Solver(name="g3", bootstrap_with=clauses) as solver:
+        prefix_lits = []
+
+        def extend():
+            while len(prefix_lits) < len(unlock_vars):
+                v = unlock_vars[len(prefix_lits)]
+                if solver.solve(assumptions=prefix_lits + [v]):
+                    prefix_lits.append(v)
+                elif solver.solve(assumptions=prefix_lits + [-v]):
+                    prefix_lits.append(-v)
+                else:
+                    return False
+            return solver.solve(assumptions=list(prefix_lits))
+
+        while True:
+            if extend():
+                chosen = {lit for lit in prefix_lits if lit > 0}
+                results.append(chosen)
+                # 永久阻塞该完整取舍，保证互异
+                solver.add_clause([-lit for lit in prefix_lits])
+                if len(results) >= limit:
+                    break
+            # 回溯：逐层弹出两个子树均已枚举完的“保留锁定”分支，
+            # 找到最近的“解除锁定”分支点并改走“保留锁定”分支
+            while prefix_lits and prefix_lits[-1] < 0:
+                prefix_lits.pop()
+            if not prefix_lits:
+                break
+            prefix_lits[-1] = -prefix_lits[-1]
+    return results
+
+
+def diagnose_unlocks(rows, cols, k, grid, locks, ones_range=None, limit=3):
+    """无解草稿诊断：求使修补可行所需解除的锁定格数量全局最少的方案。
+
+    保持尺寸、格值、K 与可选 onesRange 不变，只允许解除部分锁定格。
+    - 全部锁定格均解除仍无解（结构性无解）时返回
+      {"structural": True}，不提供任何解锁建议；
+    - 否则返回
+      {"structural": False, "unlock_count": 全局最少解锁数,
+       "options": [
+         {"unlocks": [[r, c], ...],
+          "example": {"repaired", "flips", "onesCount"}},
+         ...   # 1..limit 个互异解锁集合，按坐标列表短字典序升序
+       ]}。
+    每份 example 是在“仅解除该集合、其余锁定格不变”的约束下
+    全局翻转数最少（并列再按行展开字典序最小）的可行修补示例，
+    因此未解锁的锁定格绝不改变，且示例满足环向浮长 K 与 onesRange。
+    """
+    locked = sorted(map(tuple, locks))
+
+    # 快速路径：草稿在现有锁定下已可行 -> 无需解除任何锁定格
+    current = solve_repair_top(rows, cols, k, grid, locks, ones_range,
+                               limit=1)
+    if current is not None:
+        return {
+            "structural": False,
+            "unlock_count": 0,
+            "options": [{
+                "unlocks": [],
+                "example": current["candidates"][0],
+            }],
+        }
+
+    # 结构性检验：解除全部锁定后是否还存在可行网格
+    if solve_repair_top(rows, cols, k, grid, [], ones_range, limit=1) is None:
+        return {"structural": True}
+
+    if not locked:
+        # 没有锁定格：上面 current 可解与“全部解锁可解”一致，不会到达
+        return {"structural": True}
+
+    # 第一阶段：MaxSAT 求“最少需解除多少锁定格”。
+    # 引入解锁指示 u_x：u_x 为真时该锁定格不再固定（单位子句被弱化）。
+    cell_base = rows * cols
+    unlock_vars = [cell_base + 1 + i for i in range(len(locked))]
+    next_free = cell_base + len(locked) + 1
+    hard = []
+    hard.extend(build_hard_clauses(rows, cols, k, grid, []))
+    range_clauses, next_free = _ones_range_clauses(
+        rows, cols, ones_range, next_free)
+    hard.extend(range_clauses)
+    for (r, c), uv in zip(locked, unlock_vars):
+        cell = _var(r, c, cols)
+        lit = cell if grid[r][c] == 1 else -cell
+        hard.append([uv, lit])
+
+    wcnf = WCNF()
+    for cl in hard:
+        wcnf.append(cl)
+    for uv in unlock_vars:
+        wcnf.append([-uv], weight=1)  # 软约束：尽量不解除锁定
+
+    with RC2(wcnf, solver="g3", adapt=True, exhaust=True) as rc2:
+        model = rc2.compute()
+        assert model is not None, "全部解锁可解时 MaxSAT 必须可解"
+        best = rc2.cost
+
+    # 第二阶段：在 |解锁| == best 下按坐标列表字典序枚举前 limit 个集合
+    chosen_sets = _enumerate_unlock_sets(hard, unlock_vars, best, limit,
+                                         next_free)
+    assert chosen_sets, "最优解锁数约束下应恒有解"
+
+    unlock_by_var = {uv: pos for pos, uv in zip(locked, unlock_vars)}
+    options = []
+    for chosen in chosen_sets:
+        unlocks = sorted(unlock_by_var[lit] for lit in chosen)
+        remaining = [pos for pos in locked if pos not in set(unlocks)]
+        solved = solve_repair_top(rows, cols, k, grid, remaining,
+                                  ones_range, limit=1)
+        assert solved is not None, "枚举到的解锁集合必须使修补可行"
+        first = solved["candidates"][0]
+        options.append({
+            "unlocks": [[r, c] for r, c in unlocks],
+            "example": first,
+        })
+    return {"structural": False, "unlock_count": best, "options": options}
+
+
 def solve_repair(rows, cols, k, grid, locks, ones_range=None):
     """求字典序最小的最优修补（solve_repair_top 的单候选便捷封装）。
 
